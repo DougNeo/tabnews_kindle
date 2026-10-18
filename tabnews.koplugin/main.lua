@@ -27,7 +27,7 @@ local _ = require("gettext")
 
 local Screen = Device.screen
 
-local VERSION = "0.7"
+local VERSION = "0.8"
 local API = "https://www.tabnews.com.br/api/v1"
 local PER_PAGE = 30
 local USER_AGENT = "KOReader-TabNews/" .. VERSION
@@ -96,6 +96,43 @@ local function inline(text)
     return text
 end
 
+-- Tabelas (GFM) ------------------------------------------------------------
+local function isTableSeparator(l)
+    if not l or not l:find("-", 1, true) or not l:match("^[%s|:%-]+$") then return false end
+    return l:find("|", 1, true) ~= nil or l:match("^%s*:?%-%-%-") ~= nil
+end
+
+local function splitRow(l)
+    l = l:gsub("\\|", "\3"):gsub("^%s*|", ""):gsub("|%s*$", "")
+    local cells = {}
+    for cell in (l .. "|"):gmatch("([^|]*)|") do
+        cells[#cells + 1] = (cell:gsub("^%s+", ""):gsub("%s+$", ""):gsub("\3", "|"))
+    end
+    return cells
+end
+
+local function renderTable(header, sep, rows)
+    local aligns = {}
+    for i, c in ipairs(splitRow(sep)) do
+        if c:match("^:.*:$") then aligns[i] = "center"
+        elseif c:match(":$") then aligns[i] = "right" end
+    end
+    local ncols = #header
+    local function row(cells, tag)
+        local parts = { "<tr>" }
+        for i = 1, ncols do
+            local style = aligns[i] and (' style="text-align:' .. aligns[i] .. '"') or ""
+            parts[#parts + 1] = "<" .. tag .. style .. ">" .. inline(cells[i] or "") .. "</" .. tag .. ">"
+        end
+        parts[#parts + 1] = "</tr>"
+        return table.concat(parts)
+    end
+    local out = { "<table>", "<thead>", row(header, "th"), "</thead><tbody>" }
+    for _i, r in ipairs(rows) do out[#out + 1] = row(r, "td") end
+    out[#out + 1] = "</tbody></table>"
+    return table.concat(out, "\n")
+end
+
 function MD.toHTML(md)
     md = md:gsub("\r\n", "\n")
     local out, para, quote, code_buf = {}, {}, {}, {}
@@ -120,7 +157,12 @@ function MD.toHTML(md)
         end
     end
 
-    for line in (md .. "\n"):gmatch("(.-)\n") do
+    local lines = {}
+    for line in (md .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = line end
+    local i = 0
+    while i < #lines do
+        i = i + 1
+        local line = lines[i]
         if in_code then
             if line:match("^%s*```") then
                 out[#out + 1] = "<pre><code>" .. esc(table.concat(code_buf, "\n")) .. "</code></pre>"
@@ -134,6 +176,15 @@ function MD.toHTML(md)
         elseif line:match("^%s*>") then
             flush_para(); close_list()
             quote[#quote + 1] = (line:gsub("^%s*>%s?", ""))
+        elseif line:find("|", 1, true) and isTableSeparator(lines[i + 1]) then
+            flush_para(); close_list(); flush_quote()
+            local header, sep, rows = splitRow(line), lines[i + 1], {}
+            i = i + 1
+            while lines[i + 1] and lines[i + 1]:find("|", 1, true) and not lines[i + 1]:match("^%s*$") do
+                i = i + 1
+                rows[#rows + 1] = splitRow(lines[i])
+            end
+            out[#out + 1] = renderTable(header, sep, rows)
         else
             flush_quote()
             local level, htext = line:match("^(#+)%s+(.*)")
@@ -187,6 +238,9 @@ pre { font-family: monospace; font-size: 0.8em; white-space: pre-wrap; border-le
 code { font-family: monospace; font-size: 0.9em; }
 img { max-width: 100%; display: block; margin: 0.6em auto; }
 blockquote { margin: 0.8em 0 0.8em 0.5em; padding-left: 0.7em; border-left: 2px solid #aaa; font-style: italic; }
+table { border-collapse: collapse; width: 100%; font-size: 0.8em; margin: 0.8em 0; }
+th, td { border: 1px solid #777; padding: 0.2em 0.35em; vertical-align: top; }
+th { font-weight: bold; background-color: #ddd; }
 .comment { margin-top: 0.8em; padding-left: 0.6em; border-left: 2px solid #bbb; }
 .comment-author { font-weight: bold; font-size: 0.85em; }
 ]]
