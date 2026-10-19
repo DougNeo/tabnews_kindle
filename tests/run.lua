@@ -218,6 +218,32 @@ local menu = {}
 p:addToMainMenu(menu)
 check("menu registrado", menu.tabnews and #menu.tabnews.sub_item_table >= 8)
 
+-- conta: o menu mostra quem está conectado e sair pede confirmação
+local function findItem(items, pred)
+    for _i, it in ipairs(items or {}) do
+        if pred(it) then return it end
+        local sub = findItem(it.sub_item_table, pred)
+        if sub then return sub end
+    end
+end
+local account = findItem(menu.tabnews.sub_item_table, function(it)
+    return it.text_func and it.keep_menu_open
+end)
+check("item de conta existe", account ~= nil)
+if account then
+    check("deslogado: Entrar", account.text_func():find("Entrar", 1, true) ~= nil, account.text_func())
+    p.session = { token = "t", username = "ana", expires_at = "2999-01-01T00:00:00.000Z" }
+    check("logado: mostra usuário", account.text_func() == "Conectado como @ana", account.text_func())
+    shown = {}
+    account.callback(nil)
+    check("logado: tocar pede confirmação", shown[#shown] and shown[#shown].ok_callback ~= nil)
+    check("logado: não sai sem confirmar", p:sessionInfo() ~= nil)
+    shown[#shown].ok_callback()
+    check("confirmou: saiu", p:sessionInfo() == nil)
+    p.session = { token = "t", expires_at = "2000-01-01T00:00:00.000Z" }
+    check("sessão expirada conta como deslogado", account.text_func():find("Entrar", 1, true) ~= nil)
+end
+
 -- edição montada a partir de posts salvos
 local dir = DATA .. "/tabnews"
 local posts = {}

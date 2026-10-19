@@ -27,7 +27,7 @@ local _ = require("gettext")
 
 local Screen = Device.screen
 
-local VERSION = "0.9"
+local VERSION = "0.9.1"
 local API = "https://www.tabnews.com.br/api/v1"
 local REPO = "DougNeo/tabnews_kindle"
 local PER_PAGE = 30
@@ -768,17 +768,33 @@ function TabNews:addToMainMenu(menu_items)
                     {
                         text_func = function()
                             local s = self:sessionInfo()
-                            return s and string.format(_("Conta: @%s (sair)"), str(s.username))
-                                or _("Entrar na conta TabNews")
+                            if not s then return _("Entrar na conta TabNews") end
+                            if str(s.username) ~= "" then
+                                return string.format(_("Conectado como @%s"), s.username)
+                            end
+                            return _("Conta TabNews conectada")
                         end,
                         keep_menu_open = true,
                         callback = function(touchmenu)
-                            if self:sessionInfo() then
-                                self:logout()
-                            else
-                                self:askLogin()
+                            local function refresh()
+                                if touchmenu then pcall(touchmenu.updateItems, touchmenu) end
                             end
-                            if touchmenu then touchmenu:updateItems() end
+                            local s = self:sessionInfo()
+                            if s then
+                                -- sair só com confirmação, para um toque sem querer não deslogar
+                                UIManager:show(ConfirmBox:new{
+                                    text = str(s.username) ~= ""
+                                        and string.format(_("Sair da conta @%s?"), s.username)
+                                        or _("Sair da conta TabNews?"),
+                                    ok_text = _("Sair"),
+                                    ok_callback = function()
+                                        self:logout()
+                                        refresh()
+                                    end,
+                                })
+                            else
+                                self:askLogin(nil, refresh)
+                            end
                         end,
                     },
                     { text = _("Autores favoritos…"), callback = function() self:manageFollows() end },
@@ -1852,7 +1868,8 @@ function TabNews:sessionInfo()
     return s
 end
 
-function TabNews:askLogin(after)
+-- on_login: chamado depois de entrar (ex.: atualizar o texto do menu)
+function TabNews:askLogin(after, on_login)
     local dialog
     dialog = MultiInputDialog:new{
         title = _("Entrar no TabNews"),
@@ -1867,7 +1884,7 @@ function TabNews:askLogin(after)
                 callback = function()
                     local fields = dialog:getFields()
                     UIManager:close(dialog)
-                    self:login(fields[1], fields[2], after)
+                    self:login(fields[1], fields[2], after, on_login)
                 end,
             },
         }},
@@ -1876,7 +1893,7 @@ function TabNews:askLogin(after)
     dialog:onShowKeyboard()
 end
 
-function TabNews:login(email, password, after)
+function TabNews:login(email, password, after, on_login)
     email = str(email):gsub("^%s+", ""):gsub("%s+$", "")
     if email == "" or str(password) == "" then
         return alert(_("Preencha email e senha."))
@@ -1901,6 +1918,7 @@ function TabNews:login(email, password, after)
         }
         self:saveState()
         alert(string.format(_("Conectado como @%s."), self.session.username), 2)
+        if on_login then on_login() end
         if after then UIManager:scheduleIn(2.5, after) end
     end)
 end
