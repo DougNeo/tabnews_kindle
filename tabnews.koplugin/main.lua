@@ -27,8 +27,9 @@ local _ = require("gettext")
 
 local Screen = Device.screen
 
-local VERSION = "0.8"
+local VERSION = "0.9"
 local API = "https://www.tabnews.com.br/api/v1"
+local REPO = "DougNeo/tabnews_kindle"
 local PER_PAGE = 30
 local USER_AGENT = "KOReader-TabNews/" .. VERSION
 local POSTS_DIR = DataStorage:getDataDir() .. "/tabnews"
@@ -44,12 +45,13 @@ local EDITION_SIZE = 10                 -- posts na edição do dia
 local FAVORITE_POSTS = 5                -- posts recentes de cada autor favorito
 local AUTO_SYNC_INTERVAL = 6 * 3600     -- sincronização automática no máximo a cada 6 h
 local CLEANUP_DAYS = 30
+local UPDATE_CHECK_INTERVAL = 24 * 3600 -- procura versão nova no máximo 1x por dia
 local WORDS_PER_MINUTE = 200
 
 local function str(v) return type(v) == "string" and v or "" end
 local function num(v) return type(v) == "number" and v or 0 end
 
--- MD-BEGIN: conversor Markdown -> HTML (simples, cobre o que mais aparece no TabNews)
+-- MD-BEGIN: conversor Markdown -> HTML (cobre o que mais aparece no TabNews)
 local MD = {}
 
 local function esc(s)
@@ -61,6 +63,33 @@ MD.esc = esc
 -- e devolve o caminho local (src) ou nil para mostrar só o texto alternativo.
 MD.resolveImage = nil
 
+-- Tags HTML que podem passar (sem atributos); o resto aparece como texto
+local SAFE_TAGS = {
+    b = "b", strong = "b", i = "i", em = "i", u = "u", s = "s", del = "s", strike = "s",
+    code = "code", kbd = "code", sub = "sub", sup = "sup", mark = "b", small = "small",
+    summary = "b",
+}
+-- Tags que somem, mantendo o conteúdo
+local DROP_TAGS = { details = true, div = true, span = true, p = true, center = true }
+
+local URL_CHARS = "[%w%-%._~:/%?#@!%$&%*%+,;=%%]"
+
+local function imageHTML(url, alt, protect)
+    local src = MD.resolveImage and MD.resolveImage(url, alt)
+    if src then
+        return protect('<img src="' .. esc(src) .. '" alt="' .. esc(alt) .. '"/>')
+    end
+    return protect("<i>[imagem" .. (alt ~= "" and (": " .. esc(alt)) or "") .. "]</i>")
+end
+
+local function emphasis(text)
+    text = text:gsub("%*%*(.-)%*%*", "<b>%1</b>")
+    text = text:gsub("__(.-)__", "<b>%1</b>")
+    text = text:gsub("%*([^%*\n]+)%*", "<i>%1</i>")
+    text = text:gsub("~~(.-)~~", "<s>%1</s>")
+    return text
+end
+
 local function inline(text)
     -- trechos já convertidos ficam guardados e voltam no final,
     -- para que negrito/itálico não estraguem código, URLs e tags
@@ -69,32 +98,53 @@ local function inline(text)
         keep[#keep + 1] = html
         return "\1" .. #keep .. "\2"
     end
+    local function link(url, label_html)
+        return protect('<a href="' .. esc(url) .. '">' .. label_html .. "</a>")
+    end
+
     text = text:gsub("`([^`]+)`", function(c)
         return protect("<code>" .. esc(c) .. "</code>")
     end)
-    text = esc(text)
+
+    -- HTML cru que aparece nos posts (antes de escapar o texto)
+    text = text:gsub("<(https?://[^>%s]+)>", function(url) return link(url, esc(url)) end)
+    text = text:gsub("<img[^>]-src=[\"']([^\"']+)[\"'][^>]*>", function(src)
+        return imageHTML(src, "", protect)
+    end)
+    text = text:gsub("<a%s[^>]-href=[\"']([^\"']+)[\"'][^>]*>(.-)</a>", function(url, label)
+        return link(url, esc(label))
+    end)
+    text = text:gsub("<br%s*/?>", function() return protect("<br/>") end)
+    text = text:gsub("<(/?)(%a+)[^<>]*>", function(slash, tag)
+        tag = tag:lower()
+        if SAFE_TAGS[tag] then return protect("<" .. slash .. SAFE_TAGS[tag] .. ">") end
+        if DROP_TAGS[tag] then return " " end
+        return nil -- não é uma tag conhecida: fica como texto
+    end)
+
+    -- imagens e links em Markdown (o texto ainda não foi escapado aqui)
     text = text:gsub("!%[([^%]]*)%]%(([^%)%s]+)[^%)]*%)", function(alt, url)
-        local raw_url = url:gsub("&amp;", "&")
-        local src = MD.resolveImage and MD.resolveImage(raw_url, alt)
-        if src then
-            return protect('<img src="' .. esc(src) .. '" alt="' .. alt .. '"/>')
-        end
-        return protect("<i>[imagem" .. (alt ~= "" and (": " .. alt) or "") .. "]</i>")
+        return imageHTML(url, alt, protect)
     end)
     text = text:gsub("%[([^%]]+)%]%(([^%)%s]+)[^%)]*%)", function(label, url)
-        -- só o href é protegido; o texto do link ainda recebe negrito/itálico
-        return '<a href="' .. protect(url) .. '">' .. label .. "</a>"
+        return link(url, emphasis(esc(label)))
     end)
-    text = text:gsub("%*%*(.-)%*%*", "<b>%1</b>")
-    text = text:gsub("__(.-)__", "<b>%1</b>")
-    text = text:gsub("%*([^%*\n]+)%*", "<i>%1</i>")
-    text = text:gsub("~~(.-)~~", "<s>%1</s>")
-    -- duas passadas: um item protegido pode conter outro (ex.: código dentro de link)
-    for _pass = 1, 2 do
+
+    -- URLs soltas no texto viram link (pontuação final fica de fora)
+    text = text:gsub("https?://" .. URL_CHARS .. "+", function(url)
+        local trail = url:match("[%.,;:!%?%*]+$") or ""
+        if trail ~= "" then url = url:sub(1, #url - #trail) end
+        return link(url, esc(url)) .. trail
+    end)
+
+    text = emphasis(esc(text))
+    -- várias passadas: um item protegido pode conter outro (ex.: código dentro de link)
+    for _pass = 1, 3 do
         text = text:gsub("\1(%d+)\2", function(i) return keep[tonumber(i)] end)
     end
     return text
 end
+MD.inline = inline
 
 -- Tabelas (GFM) ------------------------------------------------------------
 local function isTableSeparator(l)
@@ -133,28 +183,70 @@ local function renderTable(header, sep, rows)
     return table.concat(out, "\n")
 end
 
+-- Listas -------------------------------------------------------------------
+local function indentOf(line)
+    local lead = line:match("^(%s*)")
+    return #lead:gsub("\t", "    ")
+end
+
+local function listItem(line)
+    local item = line:match("^%s*[-*+]%s+(.*)")
+    if item then return "ul", item end
+    item = line:match("^%s*%d+[.)]%s+(.*)")
+    if item then return "ol", item end
+    return nil
+end
+
+local function taskBox(text)
+    local mark, rest = text:match("^%[([ xX])%]%s+(.*)")
+    if not mark then return inline(text) end
+    return (mark == " " and "☐ " or "☑ ") .. inline(rest)
+end
+
 function MD.toHTML(md)
     md = md:gsub("\r\n", "\n")
     local out, para, quote, code_buf = {}, {}, {}, {}
-    local list_type, in_code = nil, false
+    local in_code = false
+    local stack = {} -- listas abertas: { type = "ul"/"ol", indent = n }; cada nível tem um <li> aberto
 
     local function flush_para()
         if #para > 0 then
-            out[#out + 1] = "<p>" .. inline(table.concat(para, " ")) .. "</p>"
+            local html = inline(table.concat(para, " "))
+            if html:match("%S") then out[#out + 1] = "<p>" .. html .. "</p>" end
             para = {}
         end
     end
+    local function close_level()
+        local top = table.remove(stack)
+        out[#out + 1] = "</li></" .. top.type .. ">"
+    end
     local function close_list()
-        if list_type then
-            out[#out + 1] = "</" .. list_type .. ">"
-            list_type = nil
-        end
+        while #stack > 0 do close_level() end
     end
     local function flush_quote()
         if #quote > 0 then
             out[#out + 1] = "<blockquote>" .. MD.toHTML(table.concat(quote, "\n")) .. "</blockquote>"
             quote = {}
         end
+    end
+    local function add_item(ltype, indent, text)
+        local top = stack[#stack]
+        if top and indent >= top.indent + 2 then
+            -- item mais recuado: abre uma lista dentro do <li> atual
+            out[#out + 1] = "<" .. ltype .. ">"
+            stack[#stack + 1] = { type = ltype, indent = indent }
+        else
+            while #stack > 1 and indent < stack[#stack].indent - 1 do close_level() end
+            top = stack[#stack]
+            if top and top.type == ltype then
+                out[#out + 1] = "</li>"
+            else
+                if top then close_level() end
+                out[#out + 1] = "<" .. ltype .. ">"
+                stack[#stack + 1] = { type = ltype, indent = indent }
+            end
+        end
+        out[#out + 1] = "<li>" .. taskBox(text)
     end
 
     local lines = {}
@@ -188,34 +280,27 @@ function MD.toHTML(md)
         else
             flush_quote()
             local level, htext = line:match("^(#+)%s+(.*)")
+            local ltype, item = listItem(line)
             if level and #level <= 6 then
                 flush_para(); close_list()
                 out[#out + 1] = string.format("<h%d>%s</h%d>", #level, inline(htext), #level)
-            elseif line:match("^%s*[-*_]%s*[-*_]%s*[-*_][-*_%s]*$") then
+            elseif line:match("^%s*[-*_]%s*[-*_]%s*[-*_][-*_%s]*$") and not (ltype and #stack > 0) then
                 flush_para(); close_list()
                 out[#out + 1] = "<hr/>"
+            elseif ltype then
+                flush_para()
+                add_item(ltype, indentOf(line), item)
+            elseif line:match("^%s*$") then
+                flush_para()
+                -- linha em branco só fecha a lista se o próximo bloco não continuar nela
+                local nxt = lines[i + 1]
+                if #stack > 0 and not (nxt and (listItem(nxt) or nxt:match("^%s%s+%S"))) then close_list() end
+            elseif #stack > 0 and line:match("^%s+%S") then
+                -- continuação do item de lista atual
+                out[#out + 1] = " " .. inline((line:gsub("^%s+", "")))
             else
-                local ltype, item = "ul", line:match("^%s*[-*+]%s+(.*)")
-                if not item then
-                    ltype, item = "ol", line:match("^%s*%d+[.)]%s+(.*)")
-                end
-                if item then
-                    flush_para()
-                    if list_type ~= ltype then
-                        close_list()
-                        out[#out + 1] = "<" .. ltype .. ">"
-                        list_type = ltype
-                    end
-                    out[#out + 1] = "<li>" .. inline(item) .. "</li>"
-                elseif line:match("^%s*$") then
-                    flush_para(); close_list()
-                elseif list_type and line:match("^%s+") then
-                    -- continuação do item de lista anterior
-                    out[#out] = out[#out]:sub(1, -6) .. " " .. inline(line:gsub("^%s+", "")) .. "</li>"
-                else
-                    close_list()
-                    para[#para + 1] = line
-                end
+                close_list()
+                para[#para + 1] = line
             end
         end
     end
@@ -265,6 +350,7 @@ end
 -- Categoria pelo título: "[Pitch] ..." ou "Dúvida: ..."
 local function categoryOf(title)
     title = str(title)
+    if title:match("^%s*%a+://") then return nil end
     local c = title:match("^%s*%[([^%]]+)%]")
     if not c then
         c = title:match("^%s*([^:%[%]]+):")
@@ -439,6 +525,49 @@ end
 
 local function alert(text, timeout)
     UIManager:show(InfoMessage:new{ text = text, timeout = timeout })
+end
+
+-- Mensagem de progresso; tocar nela marca a operação como cancelada
+local Progress = {}
+Progress.__index = Progress
+
+function Progress.new(title, cancellable)
+    return setmetatable({ title = title, cancellable = cancellable, cancelled = false }, Progress)
+end
+
+function Progress:update(text)
+    self:close()
+    local body = self.title .. (text and ("\n" .. text) or "")
+    if self.cancellable then body = body .. "\n\n" .. _("Toque aqui para cancelar.") end
+    self.widget = InfoMessage:new{
+        text = body,
+        dismiss_callback = function() self.cancelled = true end,
+    }
+    UIManager:show(self.widget)
+    UIManager:forceRePaint()
+end
+
+function Progress:close()
+    if self.widget then
+        self.widget.dismiss_callback = nil -- fechar pelo código não é cancelar
+        UIManager:close(self.widget)
+        self.widget = nil
+    end
+end
+
+-- "0.10" > "0.9"? Compara número a número
+local function versionNewer(a, b)
+    local function parts(v)
+        local t = {}
+        for n in str(v):gmatch("%d+") do t[#t + 1] = tonumber(n) end
+        return t
+    end
+    local x, y = parts(a), parts(b)
+    for i = 1, math.max(#x, #y) do
+        local p, q = x[i] or 0, y[i] or 0
+        if p ~= q then return p > q end
+    end
+    return false
 end
 
 local function isConnected()
@@ -620,6 +749,17 @@ function TabNews:addToMainMenu(menu_items)
                         callback = function() self:toggleFlag("auto_sync", false) end,
                     },
                     {
+                        text = _("Desligar Wi-Fi ao terminar a sincronização"),
+                        help_text = _("Economiza bateria: sincroniza e já desliga o Wi-Fi."),
+                        checked_func = function() return self:getFlag("wifi_off_after_sync", false) end,
+                        callback = function() self:toggleFlag("wifi_off_after_sync", false) end,
+                    },
+                    {
+                        text = _("Procurar atualizações do plugin ao sincronizar"),
+                        checked_func = function() return self:getFlag("check_updates", true) end,
+                        callback = function() self:toggleFlag("check_updates", true) end,
+                    },
+                    {
                         text = string.format(_("Apagar posts sem uso há %d dias"), CLEANUP_DAYS),
                         checked_func = function() return self:getFlag("auto_cleanup", true) end,
                         callback = function() self:toggleFlag("auto_cleanup", true) end,
@@ -643,7 +783,13 @@ function TabNews:addToMainMenu(menu_items)
                     },
                     { text = _("Autores favoritos…"), callback = function() self:manageFollows() end },
                     { text = _("Categorias escondidas…"), callback = function() self:manageHiddenCats() end, separator = true },
-                    { text = _("Apagar todos os posts salvos"), callback = function() self:clearSaved() end },
+                    { text = _("Apagar todos os posts salvos"), callback = function() self:clearSaved() end, separator = true },
+                    {
+                        text = string.format(_("Verificar atualização (você tem v%s)"), VERSION),
+                        callback = function()
+                            NetworkMgr:runWhenOnline(function() self:checkUpdate(true) end)
+                        end,
+                    },
                 },
             },
         },
@@ -1183,47 +1329,157 @@ end
 
 -- Sincronização ------------------------------------------------------------
 
+-- Sincronização em etapas: entre uma etapa e outra a tela volta a responder,
+-- e tocar na mensagem de progresso cancela o que falta.
 function TabNews:sync(silent)
-    local msg = loading(_("Sincronizando TabNews…"))
-    local function progress(text)
-        if silent then return end
-        UIManager:close(msg)
-        msg = loading(_("Sincronizando TabNews…") .. "\n" .. text)
+    if self.syncing_now then return end
+    self.syncing_now = true
+    local progress = Progress.new(_("Sincronizando TabNews…"), true)
+    local tasks, report = {}, {}
+    local counts = { relevant = 0, fav = 0 }
+    local relevant, edition_ready, pending_update = {}, false, nil
+    local function add(fn) tasks[#tasks + 1] = fn end
+    local function addFront(list)
+        for j = #list, 1, -1 do table.insert(tasks, 1, list[j]) end
     end
-    local report = {}
-
-    local relevant, done = self:downloadRelevant(SYNC_COUNT, progress)
-    if not relevant then done = 0 end
-    report[#report + 1] = string.format(_("Relevantes: %d novos"), done)
-
-    local fav_new = 0
-    if #self:followList() > 0 then
-        progress(_("Posts dos favoritos…"))
-        for _i, post in ipairs(self:fetchFavoritePosts(FAVORITE_POSTS)) do
+    local function step(text)
+        if not silent then progress:update(text) end
+    end
+    local function downloadTask(post, label)
+        return function()
+            step(label .. "\n" .. str(post.title))
             local path = self:postPath(post)
             if lfs.attributes(path, "mode") ~= "file" and self:downloadPost(post, path) then
-                fav_new = fav_new + 1
+                return true
             end
         end
-        report[#report + 1] = string.format(_("Favoritos: %d novos"), fav_new)
     end
 
-    if lfs.attributes(self:editionPath(), "mode") ~= "file" then
-        progress(_("Montando a edição do dia…"))
-        if self:makeEdition() then report[#report + 1] = _("Edição do dia pronta") end
+    -- 1. relevantes
+    add(function()
+        step(_("Buscando os mais relevantes…"))
+        local posts = fetchJSON(string.format("%s/contents?page=1&per_page=%d&strategy=relevant", API, SYNC_COUNT))
+        if type(posts) ~= "table" then return end
+        relevant = posts
+        local queue = {}
+        for i, post in ipairs(posts) do
+            if lfs.attributes(self:postPath(post), "mode") ~= "file" and not self:isHidden(post) then
+                local dl = downloadTask(post, string.format(_("Relevantes %d/%d"), i, #posts))
+                queue[#queue + 1] = function()
+                    if dl() then counts.relevant = counts.relevant + 1 end
+                end
+            end
+        end
+        addFront(queue)
+    end)
+
+    -- 2. favoritos
+    for _i, user in ipairs(self:followList()) do
+        add(function()
+            step(string.format(_("Posts de @%s…"), user))
+            local posts = fetchJSON(string.format("%s/contents/%s?strategy=new&per_page=%d&with_children=false",
+                API, user, FAVORITE_POSTS))
+            if type(posts) ~= "table" then return end
+            local queue = {}
+            for _j, post in ipairs(posts) do
+                if lfs.attributes(self:postPath(post), "mode") ~= "file" then
+                    local dl = downloadTask(post, string.format(_("Favoritos: @%s"), user))
+                    queue[#queue + 1] = function()
+                        if dl() then counts.fav = counts.fav + 1 end
+                    end
+                end
+            end
+            addFront(queue)
+        end)
     end
 
-    UIManager:close(msg)
-    local before = #self:loadIndex()
-    local index = self:updateIndex(silent)
-    report[#report + 1] = string.format(_("Busca: %d títulos (+%d)"), #index, #index - before)
+    -- 3. edição do dia
+    add(function()
+        if lfs.attributes(self:editionPath(), "mode") == "file" then return end
+        step(_("Montando a edição do dia…"))
+        local chosen = {}
+        for _i, post in ipairs(relevant) do
+            if not self:isHidden(post) and lfs.attributes(self:postPath(post), "mode") == "file" then
+                chosen[#chosen + 1] = post
+                if #chosen >= EDITION_SIZE then break end
+            end
+        end
+        edition_ready = self:buildEdition(chosen) ~= nil
+    end)
 
-    local removed = self:cleanupOld()
-    if removed > 0 then report[#report + 1] = string.format(_("Limpeza: %d posts antigos apagados"), removed) end
+    -- 4. índice de busca, uma página por etapa
+    add(function()
+        local st = self:indexStart()
+        local before = #st.posts
+        local function pageTask()
+            step(st.first_time
+                and string.format(_("Criando índice de busca… %d/%d"), st.page + 1, st.max_pages)
+                or _("Atualizando índice de busca…"))
+            if self:indexStep(st) then
+                addFront({ pageTask })
+            else
+                local posts = self:indexFinish(st)
+                report[#report + 1] = string.format(_("Busca: %d títulos (+%d)"), #posts, #posts - before)
+            end
+        end
+        addFront({ pageTask })
+    end)
 
-    self.settings:saveSetting("last_sync", os.time())
-    self.settings:flush()
-    alert(_("TabNews sincronizado") .. "\n" .. table.concat(report, "\n"), silent and 5 or nil)
+    -- 5. limpeza e atualização do plugin
+    add(function()
+        local removed = self:cleanupOld()
+        if removed > 0 then
+            report[#report + 1] = string.format(_("Limpeza: %d posts antigos apagados"), removed)
+        end
+    end)
+    add(function()
+        if not self:getFlag("check_updates", true) then return end
+        local last = self.settings:readSetting("last_update_check") or 0
+        if os.time() - last < UPDATE_CHECK_INTERVAL then return end
+        step(_("Procurando atualização do plugin…"))
+        pending_update = self:checkUpdate(false)
+        if pending_update then
+            report[#report + 1] = string.format(_("Nova versão do plugin: v%s"), pending_update.version)
+        end
+    end)
+
+    local function finish(cancelled)
+        progress:close()
+        self.syncing_now = false
+        local lines = {
+            string.format(_("Relevantes: %d novos"), counts.relevant),
+        }
+        if #self:followList() > 0 then
+            lines[#lines + 1] = string.format(_("Favoritos: %d novos"), counts.fav)
+        end
+        if edition_ready then lines[#lines + 1] = _("Edição do dia pronta") end
+        for _i, line in ipairs(report) do lines[#lines + 1] = line end
+        if cancelled then
+            table.insert(lines, 1, _("Sincronização cancelada."))
+        else
+            self.settings:saveSetting("last_sync", os.time())
+            self.settings:flush()
+        end
+        alert(_("TabNews") .. "\n" .. table.concat(lines, "\n"), silent and 5 or nil)
+        if self:getFlag("wifi_off_after_sync", false) then
+            pcall(function() NetworkMgr:turnOffWifi() end)
+        end
+        if pending_update and not silent then
+            UIManager:scheduleIn(1, function() self:offerUpdate(pending_update) end)
+        end
+    end
+
+    local function run()
+        if progress.cancelled then return finish(true) end
+        local task = table.remove(tasks, 1)
+        if not task then return finish(false) end
+        local ok, err = pcall(task)
+        if not ok then logger.warn("TabNews: etapa da sincronização falhou:", err) end
+        UIManager:scheduleIn(0.05, run)
+    end
+
+    progress:update(silent and _("Rodando em segundo plano.") or nil)
+    UIManager:scheduleIn(0.05, run)
 end
 
 function TabNews:syncNow()
@@ -1232,15 +1488,116 @@ end
 
 -- Evento do KOReader quando o Wi-Fi conecta
 function TabNews:onNetworkConnected()
-    if not self:getFlag("auto_sync", false) or self.syncing then return end
+    if not self:getFlag("auto_sync", false) or self.syncing_now or self.auto_sync_scheduled then return end
     local last = self.settings:readSetting("last_sync") or 0
     if os.time() - last < AUTO_SYNC_INTERVAL then return end
-    self.syncing = true
+    self.auto_sync_scheduled = true
     UIManager:scheduleIn(3, function()
-        local ok, err = pcall(self.sync, self, true)
-        if not ok then logger.warn("TabNews: sincronização automática falhou:", err) end
-        self.syncing = false
+        self.auto_sync_scheduled = false
+        self:sync(true)
     end)
+end
+
+-- Atualização do plugin -----------------------------------------------------
+
+-- Usa a API do GitHub; se ela recusar (limite de requisições por IP),
+-- cai para o feed Atom das releases, que não tem esse limite
+function TabNews:fetchLatestRelease()
+    local data, err = fetchJSON("https://api.github.com/repos/" .. REPO .. "/releases/latest")
+    local tag = type(data) == "table" and str(data.tag_name) or ""
+    if tag == "" then
+        local atom = httpGet("https://github.com/" .. REPO .. "/releases.atom", "application/atom+xml")
+        for t in str(atom):gmatch("/releases/tag/([^\"<]+)") do
+            if t:match("^v?%d+[%.%d]*$") then tag = t; break end
+        end
+    end
+    if tag == "" then return nil, err or "sem release" end
+    return { tag = tag, version = (tag:gsub("^v", "")) }
+end
+
+-- Devolve a release se houver versão mais nova que a instalada
+function TabNews:checkUpdate(interactive)
+    local release, err = self:fetchLatestRelease()
+    self.settings:saveSetting("last_update_check", os.time())
+    self.settings:flush()
+    if not release then
+        if interactive then alert(_("Não foi possível verificar atualizações: ") .. tostring(err)) end
+        return nil
+    end
+    if not versionNewer(release.version, VERSION) then
+        if interactive then
+            alert(string.format(_("Você já está na versão mais nova (v%s)."), VERSION), 3)
+        end
+        return nil
+    end
+    if interactive then self:offerUpdate(release) end
+    return release
+end
+
+function TabNews:pluginDir()
+    if type(self.path) == "string" and lfs.attributes(self.path, "mode") == "directory" then
+        return self.path
+    end
+    return DataStorage:getDataDir() .. "/plugins/tabnews.koplugin"
+end
+
+-- Baixa main.lua e _meta.lua da tag, confere se são Lua válido e troca os arquivos
+function TabNews:installUpdate(release)
+    local base = string.format("https://raw.githubusercontent.com/%s/%s/tabnews.koplugin/", REPO, release.tag)
+    local files = {}
+    for _i, name in ipairs({ "main.lua", "_meta.lua" }) do
+        local body, err = httpGet(base .. name, "text/plain")
+        if not body then return false, name .. ": " .. tostring(err) end
+        local chunk, perr = loadstring(body, name)
+        if not chunk then return false, name .. ": " .. tostring(perr) end
+        files[name] = body
+    end
+    if not files["main.lua"]:find('VERSION = "' .. release.version .. '"', 1, true) then
+        return false, _("a versão do arquivo não confere com a release")
+    end
+    local dir = self:pluginDir()
+    for name, body in pairs(files) do
+        local f, ferr = io.open(dir .. "/" .. name .. ".new", "w")
+        if not f then return false, ferr end
+        f:write(body)
+        f:close()
+    end
+    for name in pairs(files) do
+        local target = dir .. "/" .. name
+        os.remove(target .. ".old")
+        os.rename(target, target .. ".old")
+        local ok, rerr = os.rename(target .. ".new", target)
+        if not ok then
+            os.rename(target .. ".old", target)
+            return false, rerr
+        end
+    end
+    return true
+end
+
+function TabNews:offerUpdate(release)
+    UIManager:show(ConfirmBox:new{
+        text = string.format(_("Nova versão do TabNews: v%s (você tem v%s).\n\nAtualizar agora?"),
+            release.version, VERSION),
+        ok_text = _("Atualizar"),
+        ok_callback = function()
+            NetworkMgr:runWhenOnline(function()
+                local msg = loading(_("Baixando atualização…"))
+                local ok, err = self:installUpdate(release)
+                UIManager:close(msg)
+                if not ok then
+                    return alert(_("Não foi possível atualizar: ") .. tostring(err))
+                end
+                local text = string.format(_("TabNews atualizado para v%s.\nReinicie o KOReader para usar a nova versão."),
+                    release.version)
+                if UIManager.askForRestart then
+                    UIManager:askForRestart(text)
+                else
+                    alert(text)
+                end
+            end)
+        end,
+    })
 end
 
 -- Busca -------------------------------------------------------------------
@@ -1290,46 +1647,64 @@ function TabNews:loadIndex()
     return self.index_store:readSetting("posts") or {}
 end
 
--- Índice local de títulos: só baixa o que é novo desde a última atualização
-function TabNews:updateIndex(silent)
+-- Índice local de títulos: só baixa o que é novo desde a última atualização.
+-- Funciona em etapas (uma página por vez) para a sincronização poder ser cancelada.
+function TabNews:indexStart()
     local posts = self:loadIndex()
     local known = {}
     for _i, p in ipairs(posts) do known[p.id] = true end
     local first_time = #posts == 0
-    local max_pages = first_time and INDEX_FIRST_PAGES or INDEX_UPDATE_PAGES
-    local fresh, msg = {}, nil
-    for page = 1, max_pages do
-        if not silent and (not msg or first_time) then
-            if msg then UIManager:close(msg) end
-            msg = loading(first_time
-                and string.format(_("Criando índice de títulos (só na primeira vez)… %d/%d"), page, max_pages)
-                or _("Atualizando índice de títulos…"))
+    return {
+        posts = posts, known = known, fresh = {}, page = 0, first_time = first_time,
+        max_pages = first_time and INDEX_FIRST_PAGES or INDEX_UPDATE_PAGES,
+    }
+end
+
+-- Baixa a próxima página; devolve true se ainda há páginas a buscar
+function TabNews:indexStep(st)
+    st.page = st.page + 1
+    local data = fetchJSON(string.format("%s/contents?strategy=new&page=%d&per_page=100", API, st.page))
+    if type(data) ~= "table" or #data == 0 then return false end
+    local reached_known = false
+    for _i, p in ipairs(data) do
+        local id = str(p.id)
+        if st.known[id] then
+            reached_known = true
+        elseif id ~= "" then
+            st.known[id] = true
+            st.fresh[#st.fresh + 1] = { id = id, u = str(p.owner_username), s = str(p.slug), t = str(p.title) }
         end
-        local data = fetchJSON(string.format("%s/contents?strategy=new&page=%d&per_page=100", API, page))
-        if type(data) ~= "table" or #data == 0 then break end
-        local reached_known = false
-        for _i, p in ipairs(data) do
-            local id = str(p.id)
-            if known[id] then
-                reached_known = true
-            elseif id ~= "" then
-                known[id] = true
-                fresh[#fresh + 1] = { id = id, u = str(p.owner_username), s = str(p.slug), t = str(p.title) }
-            end
-        end
-        if reached_known then break end
     end
-    if msg then UIManager:close(msg) end
-    if #fresh > 0 then
-        for _i, p in ipairs(posts) do
-            if #fresh >= INDEX_MAX then break end
-            fresh[#fresh + 1] = p
+    return not reached_known and st.page < st.max_pages
+end
+
+function TabNews:indexFinish(st)
+    if #st.fresh > 0 then
+        local merged = st.fresh
+        for _i, p in ipairs(st.posts) do
+            if #merged >= INDEX_MAX then break end
+            merged[#merged + 1] = p
         end
-        posts = fresh
-        self.index_store:saveSetting("posts", posts)
+        st.posts, st.fresh = merged, {}
+        self.index_store:saveSetting("posts", merged)
         self.index_store:flush()
     end
-    return posts
+    return st.posts
+end
+
+function TabNews:updateIndex(silent)
+    local st = self:indexStart()
+    local msg
+    repeat
+        if not silent and (not msg or st.first_time) then
+            if msg then UIManager:close(msg) end
+            msg = loading(st.first_time
+                and string.format(_("Criando índice de títulos (só na primeira vez)… %d/%d"), st.page + 1, st.max_pages)
+                or _("Atualizando índice de títulos…"))
+        end
+    until not self:indexStep(st)
+    if msg then UIManager:close(msg) end
+    return self:indexFinish(st)
 end
 
 -- Texto completo dos posts salvos (funciona offline)
@@ -1569,5 +1944,11 @@ function TabNews:voteCurrent(kind)
         alert(text, 3)
     end)
 end
+
+-- Usado pelos testes automatizados (tests/run.lua)
+TabNews._test = {
+    MD = MD, Search = Search, categoryOf = categoryOf, versionNewer = versionNewer,
+    readingMinutes = readingMinutes, buildHTML = buildHTML, VERSION = VERSION,
+}
 
 return TabNews

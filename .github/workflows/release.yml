@@ -1,0 +1,32 @@
+name: Release
+
+# Ao enviar uma tag como v1.0, roda os testes, confere a versão e publica a release com o zip.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit lua-filesystem
+      - name: Rodar testes
+        run: luajit tests/run.lua
+      - name: Conferir versão
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -q "local VERSION = \"$VERSION\"" tabnews.koplugin/main.lua; then
+            echo "A tag $GITHUB_REF_NAME não bate com o VERSION de tabnews.koplugin/main.lua"
+            exit 1
+          fi
+      - name: Gerar zip
+        run: zip -r tabnews.koplugin.zip tabnews.koplugin
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" tabnews.koplugin.zip --title "$GITHUB_REF_NAME" --generate-notes

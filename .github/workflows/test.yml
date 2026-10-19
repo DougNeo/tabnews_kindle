@@ -1,0 +1,18 @@
+name: Testes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit lua-filesystem
+      - name: Checar sintaxe
+        run: luajit -bl tabnews.koplugin/main.lua > /dev/null && luajit -bl tabnews.koplugin/_meta.lua > /dev/null
+      - name: Rodar testes
+        run: luajit tests/run.lua
