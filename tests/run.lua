@@ -173,6 +173,10 @@ h = MD.toHTML("<script>alert(1)</script> e List<T>")
 has("script escapado", h, "&lt;script&gt;")
 hasnt("sem script real", h, "<script>")
 
+h = MD.toHTML('<div align="center">\n  <!-- Imagem 1 -->\n  <img src="https://x.png" \n       width="30%" />\n</div>')
+hasnt("comentário HTML some", h, "Imagem 1")
+hasnt("comentário HTML escapado some", h, "&lt;!--")
+
 h = MD.toHTML("> citação **x**")
 has("citação", h, "<blockquote><p>citação <b>x</b></p></blockquote>")
 
@@ -275,6 +279,26 @@ check("post aberto identificado", cur and cur.user == "user1" and cur.slug == "p
 ui.document = { file = edition }
 check("edição não é post único", p:currentPost() and p:currentPost().slug == nil)
 ui.document = nil
+
+-- post salvo com conversor antigo: abre do cache sem internet, baixa de novo com internet
+local NM = package.loaded["ui/network/manager"]
+local post2 = posts[2]
+local path2 = p:postPath(post2)
+p.saved[path2].render = nil
+local downloads = 0
+local real_download = p.downloadPost
+p.downloadPost = function() downloads = downloads + 1; return true end
+NM.isConnected = function() return false end
+p:openPost(post2)
+check("antigo + offline abre do cache", downloads == 0)
+NM.isConnected = function() return true end
+p:openPost(post2)
+check("antigo + online baixa de novo", downloads == 1)
+p.saved[path2].render = 999
+p:openPost(post2)
+check("atualizado abre do cache", downloads == 1)
+p.downloadPost = real_download
+NM.isConnected = function() return false end
 
 -- limpeza: só apaga o que está velho
 local old_path = p:postPath(posts[1])

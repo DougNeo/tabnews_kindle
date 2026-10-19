@@ -27,9 +27,11 @@ local _ = require("gettext")
 
 local Screen = Device.screen
 
-local VERSION = "0.9.1"
+local VERSION = "0.9.2"
 local API = "https://www.tabnews.com.br/api/v1"
 local REPO = "DougNeo/tabnews_kindle"
+-- Aumente quando o conversor de Markdown mudar: posts salvos antes são baixados de novo ao abrir
+local RENDER_VERSION = 2
 local PER_PAGE = 30
 local USER_AGENT = "KOReader-TabNews/" .. VERSION
 local POSTS_DIR = DataStorage:getDataDir() .. "/tabnews"
@@ -106,6 +108,8 @@ local function inline(text)
         return protect("<code>" .. esc(c) .. "</code>")
     end)
 
+    -- comentários HTML (<!-- ... -->) não aparecem no texto
+    text = text:gsub("<!%-%-.-%-%->", "")
     -- HTML cru que aparece nos posts (antes de escapar o texto)
     text = text:gsub("<(https?://[^>%s]+)>", function(url) return link(url, esc(url)) end)
     text = text:gsub("<img[^>]-src=[\"']([^\"']+)[\"'][^>]*>", function(src)
@@ -1122,6 +1126,7 @@ function TabNews:downloadPost(post, path)
         images = images,
         downloaded = os.time(),
         opened = old.opened,
+        render = RENDER_VERSION,
     }
     self:saveState()
     return true
@@ -1131,11 +1136,15 @@ function TabNews:openPost(post)
     local path = self:postPath(post)
     local info = self.saved[path]
     local has_new = info and info.comments and num(post.children_deep_count) > info.comments
-    if lfs.attributes(path, "mode") == "file" and not has_new then
+    -- post salvo com uma versão antiga do conversor: baixa de novo se houver internet
+    local outdated = info and (info.render or 0) < RENDER_VERSION and isConnected()
+    if lfs.attributes(path, "mode") == "file" and not has_new and not outdated then
         return self:openFile(path, post)
     end
     NetworkMgr:runWhenOnline(function()
-        local msg = loading(has_new and _("Baixando comentários novos…") or _("Baixando post…"))
+        local msg = loading(has_new and _("Baixando comentários novos…")
+            or outdated and _("Atualizando o post para a versão nova do plugin…")
+            or _("Baixando post…"))
         local ok, err = self:downloadPost(post, path)
         UIManager:close(msg)
         if ok then
@@ -1333,12 +1342,16 @@ function TabNews:clearSaved()
             for name in lfs.dir(POSTS_DIR) do
                 if name:match("%.html$") then names[#names + 1] = name end
             end
-            local n = 0
+            local n, kept = 0, false
             for _i, name in ipairs(names) do
-                if self:removeSaved(POSTS_DIR .. "/" .. name) then n = n + 1 end
+                if self:removeSaved(POSTS_DIR .. "/" .. name) then n = n + 1 else kept = true end
             end
             self:saveState()
-            alert(string.format(_("%d posts apagados."), n))
+            local text = string.format(_("%d posts apagados."), n)
+            if kept then
+                text = text .. "\n" .. _("O documento aberto agora não foi apagado. Feche-o e apague de novo, se quiser.")
+            end
+            alert(text)
         end,
     })
 end
