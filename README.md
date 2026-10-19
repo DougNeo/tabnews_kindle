@@ -5,6 +5,8 @@
 
 Leia o [TabNews](https://www.tabnews.com.br) no seu e-reader, como se fosse um livro. Os posts viram documentos do KOReader, com as suas fontes, margens e realces, e ficam salvos para ler offline.
 
+![TabNews no Kindle: edição do dia, lista de posts e menu do plugin](docs/capturas.jpg)
+
 ## O que dá para fazer
 
 - **Edição do dia:** os 10 posts mais relevantes num único documento com índice, como um jornal
